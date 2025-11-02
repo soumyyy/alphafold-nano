@@ -201,15 +201,15 @@ def plot_training(log_array: np.ndarray, out_path: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CartPole actor-critic trainer")
-    parser.add_argument("--updates", type=int, default=500, help="Number of policy updates")
-    parser.add_argument("--episodes-per-update", type=int, default=10, help="Episodes collected before each update")
+    parser.add_argument("--updates", type=int, default=1000, help="Number of policy updates")
+    parser.add_argument("--episodes-per-update", type=int, default=15, help="Episodes collected before each update")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-    parser.add_argument("--lr", type=float, default=2e-3, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--entropy-coef", type=float, default=0.01, help="Entropy regularization coefficient")
-    parser.add_argument("--value-coef", type=float, default=0.5, help="Value loss weight")
+    parser.add_argument("--value-coef", type=float, default=0.7, help="Value loss weight")
     parser.add_argument("--grad-clip", type=float, default=0.5, help="Gradient clip norm")
     parser.add_argument("--hidden-dim", type=int, default=64, help="Hidden layer width")
-    parser.add_argument("--log-interval", type=int, default=20, help="Number of updates between console logs")
+    parser.add_argument("--log-interval", type=int, default=40, help="Number of updates between console logs")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     args = parser.parse_args()
 

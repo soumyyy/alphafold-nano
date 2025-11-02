@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Streamlit dashboard for alphafold-nano.
+"""AlphaFold-nano dashboard (Streamlit).
 
-Tabs:
-- CartPole: training curves, quick greedy evaluation.
-- FrozenLake: win-rate curve, evaluation.
-- AlphaFold-nano: overlay toy backbone with AlphaFold CA trace and deviation metric.
+Presents CartPole and FrozenLake RL training summaries plus a toy AlphaFold overlay.
+All inputs are local artifacts; the app must never fail when files are missing.
 """
 
 from __future__ import annotations
 
-import os
+import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import Optional, Tuple
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
@@ -22,97 +20,126 @@ import torch
 from torch import nn
 from torch.distributions import Categorical
 
+# ---------------------------------------------------------------------------
+# Constants and styling
+# ---------------------------------------------------------------------------
+
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
 MODELS_DIR = BASE_DIR / "models"
 LOGS_DIR = BASE_DIR / "logs"
+DATA_DIR = BASE_DIR / "data"
+
+CARTPOLE_LOG_PATH = LOGS_DIR / "cartpole" / "training_log.npy"
+CARTPOLE_MODEL_PATH = MODELS_DIR / "cartpole_policy.pt"
+CARTPOLE_EVAL_SEED = 0
+
+FROZENLAKE_LOG_PATH = LOGS_DIR / "frozenlake" / "win_rate.npy"
+FROZENLAKE_Q_PATH = MODELS_DIR / "frozenlake_q.npy"
+FROZEN_EVAL_SEED = 0
+
+ACC_LIST_PATH = DATA_DIR / "alphafold" / "ecoli_selected_accessions.txt"
+ALPHAFOLD_DIR = DATA_DIR / "alphafold"
+TOY_COORDS_DIR = DATA_DIR / "mini_coords"
+
+FROZEN_EPSILON_START = 1.0
+FROZEN_EPSILON_END = 0.05
+FROZEN_EPSILON_DECAY = 20_000
+FROZEN_ALPHA_START = 0.1
+FROZEN_ALPHA_END = 0.01
+FROZEN_ALPHA_DECAY = 20_000
+
+ACCENT_TOY = "tab:blue"
+ACCENT_AF = "tab:orange"
+TARGET_COLOR = "tab:red"
+
+plt.style.use("default")
+plt.rcParams.update(
+    {
+        "axes.facecolor": "#fff1dd",
+        "figure.facecolor": "#fff1dd",
+        "axes.edgecolor": "#443c32",
+        "axes.labelcolor": "#2a261f",
+        "xtick.color": "#2a261f",
+        "ytick.color": "#2a261f",
+        "legend.frameon": True,
+        "legend.framealpha": 0.92,
+    }
+)
 
 st.set_page_config(page_title="AlphaFold-nano Dashboard", layout="wide")
-plt.style.use("dark_background")
-
 st.markdown(
     """
     <style>
-    :root {
-        --bg-color: #050505;
-        --panel-color: #111111;
-        --accent-color: #4CC9F0;
-        --accent-secondary: #F72585;
-        --text-color: #F5F5F5;
-        --muted-color: #C3C3C3;
-    }
+    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;600;700&display=swap');
     body, .stApp {
-        background-color: var(--bg-color);
-        color: var(--text-color);
+        background: radial-gradient(circle at top, #fff8ed 0%, #ffeeda 45%, #ffe5c7 100%);
+        font-family: 'DM Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+        color: #2a261f;
     }
-    header {visibility: hidden;}
     .block-container {
-        padding-top: 2rem;
-        padding-bottom: 3rem;
+        max-width: 900px;
+        margin: auto;
+        padding-top: 1.5rem;
     }
-    .floating-nav {
-        position: sticky;
-        top: 1rem;
-        z-index: 999;
-        margin-bottom: 2.5rem;
-    }
-    .floating-nav div[data-testid="column"] {
-        display: flex;
+    .stTabs [data-baseweb="tab-list"] {
         justify-content: center;
+        gap: 1rem;
     }
-    .floating-nav div[data-testid="stButton"] > button {
-        width: 110px;
-        height: 110px;
-        border-radius: 28px;
-        background: rgba(20, 20, 20, 0.92);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        box-shadow: 0px 20px 40px rgba(0, 0, 0, 0.45);
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        gap: 0.4rem;
-        transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
-        cursor: pointer;
-        font-size: 0.9rem;
+    .stTabs [data-baseweb="tab"] {
+        background: rgba(255, 255, 255, 0.55);
+        border-radius: 999px;
+        padding: 0.5rem 1.5rem;
+        border: 1px solid rgba(78, 64, 46, 0.25);
+        color: #5a5045;
         font-weight: 600;
-        color: var(--muted-color);
-        text-align: center;
-        background-image: none;
-        white-space: pre-line;
     }
-    .floating-nav div[data-testid="stButton"] > button::first-line {
-        font-size: 2rem;
+    .stTabs [aria-selected="true"] {
+        background: linear-gradient(135deg, #f8b66f, #f58c4d);
+        color: #2a261f !important;
+        border-color: transparent;
+        box-shadow: 0 10px 25px rgba(245, 140, 77, 0.25);
     }
-    .floating-nav div[data-testid="stButton"] > button:hover {
-        transform: translateY(-6px) scale(1.05);
-        box-shadow: 0px 24px 50px rgba(67, 97, 238, 0.35);
-        border-color: rgba(76, 201, 240, 0.5);
+    .stTabs [data-baseweb="tab-highlight"] {
+        background: transparent !important;
     }
-    .floating-nav div[data-testid="stButton"] > button span {
-        display: block;
-        line-height: 1.2;
+    .metric-label {font-size: 0.8rem; color: #6e6256; text-transform: uppercase; letter-spacing: 0.04em;}
+    .metric-value {font-size: 1.6rem; font-weight: 700; color: #2a261f;}
+    .metric-box {
+        backdrop-filter: blur(14px);
+        background: rgba(255, 255, 255, 0.55);
+        border-radius: 24px;
+        border: 1px solid rgba(90, 77, 63, 0.35);
+        box-shadow: 0 18px 35px rgba(120, 94, 70, 0.18);
+        padding: 1.2rem 1.4rem;
+        margin-bottom: 1.5rem;
     }
-    .stMetric {
-        background: rgba(255,255,255,0.04);
-        border-radius: 16px;
-        padding: 0.75rem 1rem;
+    .metric-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 1.1rem;
     }
-    .stMetric label, .stMetric span, .stMetric div {
-        color: var(--text-color) !important;
+    .metric-card {
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.8), rgba(255, 244, 225, 0.5));
+        border-radius: 18px;
+        padding: 0.8rem 1rem;
+        border: 1px solid rgba(244, 200, 150, 0.5);
     }
-    .stExpander {
-        background: rgba(255,255,255,0.04);
-        border-radius: 12px;
-        border: 1px solid rgba(255,255,255,0.08);
-    }
+    h1, h2, h3, h4 {color: #2a261f; font-weight: 700;}
+    .stSlider label {color: #4d4339;}
+    .stSlider .css-1cpxqw2 {color: #4d4339;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+
 
 class ActorCritic(nn.Module):
+    """Matches the training architecture used for CartPole."""
+
     def __init__(self, obs_dim: int, hidden_dim: int = 64, n_actions: int = 2) -> None:
         super().__init__()
         self.base = nn.Sequential(
@@ -131,41 +158,134 @@ class ActorCritic(nn.Module):
         return logits, value
 
 
+# ---------------------------------------------------------------------------
+# Helpers: IO with defensive error reporting
+# ---------------------------------------------------------------------------
+
+
+def _resolve(path: Path) -> str:
+    return str(path.resolve())
+
+
+def load_cartpole_log() -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    if not CARTPOLE_LOG_PATH.exists():
+        return None, f"Missing CartPole log file: {_resolve(CARTPOLE_LOG_PATH)}"
+    try:
+        data = np.load(CARTPOLE_LOG_PATH)
+    except Exception as exc:  # pragma: no cover - defensive
+        return None, f"Failed to load { _resolve(CARTPOLE_LOG_PATH) }: {exc}"
+    if data.ndim != 2 or data.shape[1] < 4:
+        return None, f"Unexpected format in { _resolve(CARTPOLE_LOG_PATH) }"
+    df = pd.DataFrame(
+        data[:, :4],
+        columns=["update", "mean_return", "policy_loss", "value_loss"],
+    )
+    return df, None
+
+
 @st.cache_resource(show_spinner=False)
-def load_cartpole_model() -> ActorCritic | None:
-    model_path = MODELS_DIR / "cartpole_policy.pt"
-    if not model_path.exists():
-        return None
-    env = gym.make("CartPole-v1")
-    obs_dim = env.observation_space.shape[0]
-    n_actions = env.action_space.n
-    env.close()
+def load_cartpole_model() -> Tuple[Optional[ActorCritic], Optional[str]]:
+    if not CARTPOLE_MODEL_PATH.exists():
+        return None, f"Missing CartPole model file: {_resolve(CARTPOLE_MODEL_PATH)}"
+    try:
+        env = gym.make("CartPole-v1")
+        obs_dim = env.observation_space.shape[0]
+        n_actions = env.action_space.n
+        env.close()
+    except Exception as exc:  # pragma: no cover - gym should be present
+        return None, f"Gymnasium unavailable: {exc}"
     model = ActorCritic(obs_dim, n_actions=n_actions)
-    state = torch.load(model_path, map_location="cpu")
-    model.load_state_dict(state)
+    try:
+        state = torch.load(CARTPOLE_MODEL_PATH, map_location="cpu")
+        model.load_state_dict(state)
+    except Exception as exc:
+        return None, f"Failed to load CartPole weights: {exc}"
     model.eval()
-    return model
+    return model, None
+
+
+def load_frozenlake_log() -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    if not FROZENLAKE_LOG_PATH.exists():
+        return None, f"Missing FrozenLake log file: {_resolve(FROZENLAKE_LOG_PATH)}"
+    try:
+        data = np.load(FROZENLAKE_LOG_PATH)
+    except Exception as exc:
+        return None, f"Failed to load { _resolve(FROZENLAKE_LOG_PATH) }: {exc}"
+    if data.ndim != 2 or data.shape[1] < 2:
+        return None, f"Unexpected format in { _resolve(FROZENLAKE_LOG_PATH) }"
+    df = pd.DataFrame(data[:, :2], columns=["episode", "win_rate"])
+    return df, None
+
+
+@st.cache_resource(show_spinner=False)
+def load_frozenlake_q() -> Tuple[Optional[np.ndarray], Optional[str]]:
+    if not FROZENLAKE_Q_PATH.exists():
+        return None, f"Missing FrozenLake Q-table: {_resolve(FROZENLAKE_Q_PATH)}"
+    try:
+        table = np.load(FROZENLAKE_Q_PATH)
+    except Exception as exc:
+        return None, f"Failed to load { _resolve(FROZENLAKE_Q_PATH) }: {exc}"
+    return table, None
 
 
 @st.cache_data(show_spinner=False)
-def load_cartpole_log() -> pd.DataFrame | None:
-    log_path = LOGS_DIR / "cartpole" / "training_log.npy"
-    if not log_path.exists():
-        return None
-    data = np.load(log_path)
-    df = pd.DataFrame(
-        data,
-        columns=["update", "mean_return", "policy_loss", "value_loss"],
-    )
-    return df
+def load_accessions() -> Tuple[Optional[list[str]], Optional[str]]:
+    if not ACC_LIST_PATH.exists():
+        return None, f"Missing accession list: {_resolve(ACC_LIST_PATH)}"
+    try:
+        with open(ACC_LIST_PATH, "r", encoding="utf-8") as handle:
+            accs = [line.strip() for line in handle if line.strip()]
+    except Exception as exc:
+        return None, f"Failed to read { _resolve(ACC_LIST_PATH) }: {exc}"
+    return accs, None
 
 
-def evaluate_cartpole(model: ActorCritic, episodes: int, seed: int = 123) -> Tuple[float, float]:
+@st.cache_data(show_spinner=False)
+def parse_pdb_ca(pdb_path: Path) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    if not pdb_path.exists():
+        return None, f"Missing AlphaFold PDB: {_resolve(pdb_path)}"
+    coords: list[Tuple[float, float, float]] = []
+    try:
+        with open(pdb_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("ATOM") and line[12:16].strip() == "CA":
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    coords.append((x, y, z))
+    except Exception as exc:
+        return None, f"Failed to parse { _resolve(pdb_path) }: {exc}"
+    if not coords:
+        return None, f"No Cα atoms found in { _resolve(pdb_path) }"
+    return np.asarray(coords, dtype=np.float32), None
+
+
+@st.cache_data(show_spinner=False)
+def load_toy_coords(path: Path) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    if not path.exists():
+        return None, f"Missing toy coordinates: {_resolve(path)}"
+    try:
+        coords = np.load(path)
+    except Exception as exc:
+        return None, f"Failed to load { _resolve(path) }: {exc}"
+    if coords.ndim != 3 or coords.shape[1:] != (3, 3):
+        return None, f"Unexpected toy coordinate shape in { _resolve(path) }"
+    return coords.astype(np.float32), None
+
+
+# ---------------------------------------------------------------------------
+# Evaluation helpers
+# ---------------------------------------------------------------------------
+
+
+def evaluate_cartpole(model: ActorCritic, episodes: int) -> Tuple[float, float, float]:
+    start = time.perf_counter()
     env = gym.make("CartPole-v1")
-    env.reset(seed=seed)
-    returns: List[float] = []
+    env.reset(seed=CARTPOLE_EVAL_SEED)
+    env.action_space.seed(CARTPOLE_EVAL_SEED)
+    returns: list[float] = []
     with torch.no_grad():
-        for ep in range(episodes):
+        for _ in range(episodes):
             obs, _ = env.reset()
             done = False
             total = 0.0
@@ -174,355 +294,285 @@ def evaluate_cartpole(model: ActorCritic, episodes: int, seed: int = 123) -> Tup
                 logits, _ = model(obs_tensor)
                 action = torch.argmax(logits).item()
                 obs, reward, terminated, truncated, _ = env.step(action)
-                total += reward
+                total += float(reward)
                 done = terminated or truncated
             returns.append(total)
     env.close()
-    returns_arr = np.array(returns, dtype=np.float32)
-    return float(returns_arr.mean()), float(returns_arr.std())
+    arr = np.asarray(returns, dtype=np.float32)
+    elapsed = time.perf_counter() - start
+    return float(arr.mean()), float(arr.std()), elapsed
 
 
-@st.cache_data(show_spinner=False)
-def load_frozenlake_log() -> pd.DataFrame | None:
-    win_path = LOGS_DIR / "frozenlake" / "win_rate.npy"
-    if not win_path.exists():
-        return None
-    data = np.load(win_path)
-    df = pd.DataFrame(data, columns=["episode", "win_rate"])
-    return df
-
-
-@st.cache_data(show_spinner=False)
-def load_frozenlake_q() -> np.ndarray | None:
-    q_path = MODELS_DIR / "frozenlake_q.npy"
-    if not q_path.exists():
-        return None
-    return np.load(q_path)
-
-
-def evaluate_frozenlake(Q: np.ndarray, episodes: int, seed: int = 123) -> float:
+def evaluate_frozenlake(q_table: np.ndarray, episodes: int) -> Tuple[float, float]:
+    start = time.perf_counter()
     env = gym.make("FrozenLake-v1", map_name="8x8", is_slippery=True)
-    env.reset(seed=seed)
-    rng = np.random.default_rng(seed)
+    env.reset(seed=FROZEN_EVAL_SEED)
     wins = 0
     for _ in range(episodes):
         state, _ = env.reset()
         done = False
         while not done:
-            action = int(np.argmax(Q[state]))
+            action = int(np.argmax(q_table[state]))
             state, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
             if terminated and reward > 0:
                 wins += 1
     env.close()
-    return wins / max(episodes, 1)
+    elapsed = time.perf_counter() - start
+    win_rate = wins / max(episodes, 1)
+    return float(win_rate), elapsed
 
 
-@st.cache_data(show_spinner=False)
-def load_accessions() -> List[str]:
-    acc_path = DATA_DIR / "alphafold" / "ecoli_selected_accessions.txt"
-    if not acc_path.exists():
-        return []
-    with open(acc_path, "r", encoding="utf-8") as handle:
-        return [line.strip() for line in handle if line.strip()]
+def linear_schedule(episode: float, start: float, end: float, decay_steps: float) -> float:
+    fraction = min(max(episode, 0.0) / max(decay_steps, 1.0), 1.0)
+    return start + fraction * (end - start)
 
 
-def load_pdb_ca(path: Path) -> np.ndarray:
-    coords: List[Tuple[float, float, float]] = []
-    if not path.exists():
-        return np.empty((0, 3), dtype=np.float32)
-    with open(path, "r", encoding="utf-8") as handle:
-        for line in handle:
-            if line.startswith("ATOM") and line[12:16].strip() == "CA":
-                x = float(line[30:38])
-                y = float(line[38:46])
-                z = float(line[46:54])
-                coords.append((x, y, z))
-    return np.array(coords, dtype=np.float32)
-
-
-def load_toy_coords(acc: str) -> np.ndarray:
-    toy_path = DATA_DIR / "mini_coords" / f"{acc}_coords.npy"
-    if not toy_path.exists():
-        return np.empty((0, 3, 3), dtype=np.float32)
-    return np.load(toy_path)
-
-
-def _style_axis(ax: plt.Axes) -> None:
-    ax.set_facecolor("#181818")
-    ax.spines["bottom"].set_color("#444")
-    ax.spines["top"].set_color("#444")
-    ax.spines["left"].set_color("#444")
-    ax.spines["right"].set_color("#444")
-    ax.tick_params(colors="#E5E5E5")
-    for text in ax.get_xticklabels() + ax.get_yticklabels():
-        text.set_fontsize(10)
-
-
-def _style_legend(leg: plt.Legend) -> None:
-    leg.get_frame().set_facecolor("#1E1E1E")
-    leg.get_frame().set_edgecolor("#333333")
-    for text in leg.get_texts():
-        text.set_color("#F5F5F5")
-
-
-def plot_cartpole(df: pd.DataFrame) -> None:
-    fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True, facecolor="#101010")
-    axes[0].plot(df["update"], df["mean_return"], label="Mean Return", color="#4CC9F0", linewidth=2)
-    axes[0].axhline(475, color="#F72585", linestyle="--", linewidth=1.5, label="Target 475")
-    axes[0].set_ylabel("Mean Return", color="#F5F5F5")
-    axes[0].grid(alpha=0.15, color="#2A2A2A")
-    _style_axis(axes[0])
-    legend0 = axes[0].legend(loc="upper left")
-    _style_legend(legend0)
-
-    axes[1].plot(df["update"], df["policy_loss"], label="Policy Loss", color="#72EFDD", linewidth=2)
-    axes[1].plot(df["update"], df["value_loss"], label="Value Loss", color="#FFA600", linewidth=1.8, alpha=0.85)
-    axes[1].set_xlabel("Update", color="#F5F5F5")
-    axes[1].set_ylabel("Loss", color="#F5F5F5")
-    axes[1].grid(alpha=0.15, color="#2A2A2A")
-    _style_axis(axes[1])
-    legend1 = axes[1].legend(loc="upper left")
-    _style_legend(legend1)
-
-    fig.tight_layout()
-    st.pyplot(fig, use_container_width=False)
-    plt.close(fig)
-
-
-def plot_frozenlake(df: pd.DataFrame) -> None:
-    fig, ax = plt.subplots(figsize=(8, 4.5), facecolor="#101010")
-    ax.plot(df["episode"], df["win_rate"], label="Win Rate", color="#4CC9F0", linewidth=2)
-    ax.axhline(0.8, color="#F72585", linestyle="--", linewidth=1.5, label="Target 0.80")
-    ax.set_xlabel("Episode", color="#F5F5F5")
-    ax.set_ylabel("Win Rate", color="#F5F5F5")
-    ax.set_ylim(0.0, 1.0)
-    ax.grid(alpha=0.15, color="#2A2A2A")
-    _style_axis(ax)
-    legend = ax.legend(loc="lower right")
-    _style_legend(legend)
-
-    fig.tight_layout()
-    st.pyplot(fig, use_container_width=False)
-    plt.close(fig)
-
-
-def plot_overlay(alpha_coords: np.ndarray, toy_coords: np.ndarray) -> Tuple[plt.Figure, float]:
-    if alpha_coords.size == 0 or toy_coords.size == 0:
-        fig, ax = plt.subplots(figsize=(6, 6), facecolor="#101010")
-        ax.set_facecolor("#181818")
-        ax.text(0.5, 0.5, "Missing coordinates", ha="center", va="center")
-        ax.axis("off")
-        return fig, float("nan")
+def compute_ca_deviation(alpha_coords: np.ndarray, toy_coords: np.ndarray) -> float:
     toy_ca = toy_coords[:, 1, :]
-    L = min(len(alpha_coords), len(toy_ca))
+    L = min(alpha_coords.shape[0], toy_ca.shape[0])
     if L == 0:
-        fig, ax = plt.subplots(figsize=(6, 6), facecolor="#101010")
-        ax.set_facecolor("#181818")
-        ax.text(0.5, 0.5, "Empty coordinates", ha="center", va="center")
+        return float("nan")
+    diffs = toy_ca[:L] - alpha_coords[:L]
+    dists = np.linalg.norm(diffs, axis=1)
+    return float(dists.mean())
+
+
+# ---------------------------------------------------------------------------
+# Plot utilities
+# ---------------------------------------------------------------------------
+
+
+def plot_cartpole_training(df: pd.DataFrame) -> None:
+    fig, axes = plt.subplots(2, 1, figsize=(9, 6), sharex=True)
+
+    axes[0].plot(df["update"], df["mean_return"], color="#333333", linewidth=2, label="Mean Return")
+    axes[0].axhline(475, color=TARGET_COLOR, linestyle="--", linewidth=1.5, label="Target 475")
+    axes[0].set_ylabel("Mean Return")
+    axes[0].legend()
+
+    axes[1].plot(df["update"], df["policy_loss"], color="#555555", linewidth=1.6, label="Policy Loss")
+    axes[1].plot(df["update"], df["value_loss"], color="#888888", linewidth=1.6, label="Value Loss")
+    axes[1].set_xlabel("Update")
+    axes[1].set_ylabel("Loss")
+    axes[1].legend()
+
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def plot_frozenlake_training(df: pd.DataFrame) -> None:
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.plot(df["episode"], df["win_rate"], color="#333333", linewidth=2, label="Win Rate")
+    ax.axhline(0.80, color=TARGET_COLOR, linestyle="--", linewidth=1.5, label="Target 0.80")
+    ax.set_xlabel("Episode")
+    ax.set_ylabel("Win Rate")
+    ax.set_ylim(0.0, 1.0)
+    ax.legend()
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def plot_backbone_overlay(alpha_coords: np.ndarray, toy_coords: np.ndarray) -> None:
+    fig, ax = plt.subplots(figsize=(9, 6))
+    toy_ca = toy_coords[:, 1, :]
+    L = min(alpha_coords.shape[0], toy_ca.shape[0])
+    if L == 0:
+        ax.text(0.5, 0.5, "No overlapping residues", ha="center", va="center")
         ax.axis("off")
-        return fig, float("nan")
+        st.pyplot(fig)
+        plt.close(fig)
+        return
     alpha_xy = alpha_coords[:L, :2]
     toy_xy = toy_ca[:L, :2]
-    deviations = np.linalg.norm(alpha_coords[:L] - toy_ca[:L], axis=1)
-    mean_dev = float(deviations.mean())
-
-    fig, ax = plt.subplots(figsize=(6, 6), facecolor="#101010")
-    ax.set_facecolor("#181818")
-    ax.plot(alpha_xy[:, 0], alpha_xy[:, 1], "-o", label="AlphaFold CA", color="#4CC9F0", markersize=4, linewidth=2)
-    ax.plot(toy_xy[:, 0], toy_xy[:, 1], "-o", label="Toy CA", color="#FFA600", markersize=4, linewidth=2)
-    ax.set_xlabel("X", color="#F5F5F5")
-    ax.set_ylabel("Y", color="#F5F5F5")
-    ax.set_title("Backbone XY Overlay", color="#F5F5F5")
-    ax.set_aspect("equal", "box")
-    ax.grid(alpha=0.15, color="#2A2A2A")
-    _style_axis(ax)
-    legend = ax.legend(loc="upper left")
-    _style_legend(legend)
+    ax.plot(alpha_xy[:, 0], alpha_xy[:, 1], "-o", color=ACCENT_AF, linewidth=1.8, markersize=4, label="AlphaFold Cα")
+    ax.plot(toy_xy[:, 0], toy_xy[:, 1], "-o", color=ACCENT_TOY, linewidth=1.8, markersize=4, label="Toy Cα")
+    ax.set_xlabel("X (Å)")
+    ax.set_ylabel("Y (Å)")
+    ax.legend()
+    ax.set_aspect("equal", adjustable="datalim")
     fig.tight_layout()
-    return fig, mean_dev
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Streamlit layout
+# ---------------------------------------------------------------------------
 
 
 st.title("AlphaFold-nano")
-st.markdown(
-    """
-    **Welcome!** This dashboard walks through a miniature end-to-end workflow:
-
-    - **Reinforcement Learning.** We teach a tiny agent to balance the CartPole and solve the FrozenLake maze.
-    - **Protein Toy Model.** We turn amino-acid sequences into a coarse backbone and compare it to AlphaFold predictions.
-
-    Use the floating bar to explore the journey. Each view includes a quick primer so the visuals make sense even if you're new to the topic.
-    """
+st.subheader(
+    "Reinforcement learning benchmarks and a sample sequence→structure overlay for *E. coli* accessions (with limited contraints)"
 )
 
-with st.container():
-    st.markdown('<div class="floating-nav">', unsafe_allow_html=True)
-    section = st.session_state.get("section", "CartPole")
-    dock_buttons = [("CartPole", ""), ("FrozenLake", ""), ("AlphaFold", "🧬")]
-    cols = st.columns(len(dock_buttons))
-    active_index = 1
-    for idx, (label, emoji) in enumerate(dock_buttons, start=1):
-        if section == label:
-            active_index = idx
-        with cols[idx - 1]:
-            if st.button(f"{emoji}{label}", key=f"dock_{label}", use_container_width=False):
-                st.session_state["section"] = label
-    st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown(
-        f"""
-        <style>
-        .floating-nav div[data-testid="column"]:nth-of-type({active_index}) div[data-testid="stButton"] > button {{
-            transform: translateY(-10px) scale(1.08);
-            border-color: transparent;
-            background: linear-gradient(135deg, #4CC9F0, #4361EE);
-            box-shadow: 0px 28px 60px rgba(67, 97, 238, 0.45);
-            color: #051937;
-        }}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+cartpole_tab, frozenlake_tab, alphafold_tab = st.tabs(["CartPole", "FrozenLake", "AlphaFold-nano"])
 
-section = st.session_state.get("section", "CartPole")
-
-if section == "CartPole":
-    st.header("CartPole: learning to balance")
-    st.markdown(
-        """
-        **Goal:** Keep the pole upright for as long as possible. A perfect score is 500 steps.
-
-        The agent watches the cart's position/velocity and the pole's angle, then decides to push left or right.
-        """
-    )
-
-    log_df = load_cartpole_log()
-    if log_df is None:
-        st.warning("CartPole training log not found.")
+# CartPole tab ----------------------------------------------------------------
+with cartpole_tab:
+    log_df, log_err = load_cartpole_log()
+    if log_err:
+        st.error(log_err)
     else:
-        latest_return = float(log_df["mean_return"].iloc[-1])
-        best_return = float(log_df["mean_return"].max())
-        mean_policy_loss = float(log_df["policy_loss"].tail(50).mean())
+        latest_row = log_df.iloc[-1]
+        best_mean = float(np.nanmax(log_df["mean_return"]))
+        st.markdown(
+            """
+            <div class="metric-box">
+              <div class="metric-grid">
+                <div class="metric-card">
+                  <div class="metric-label">Mean Return (latest)</div>
+                  <div class="metric-value">{mean_latest:.1f}</div>
+                </div>
+                <div class="metric-card">
+                  <div class="metric-label">Best Mean Return</div>
+                  <div class="metric-value">{best_mean:.1f}</div>
+                </div>
+                <div class="metric-card">
+                  <div class="metric-label">Updates Trained</div>
+                  <div class="metric-value">{updates}</div>
+                </div>
+                <div class="metric-card">
+                  <div class="metric-label">Policy Loss (latest)</div>
+                  <div class="metric-value">{policy_loss:.4f}</div>
+                </div>
+                <div class="metric-card">
+                  <div class="metric-label">Value Loss (latest)</div>
+                  <div class="metric-value">{value_loss:.1f}</div>
+                </div>
+              </div>
+            </div>
+            """.format(
+                mean_latest=latest_row["mean_return"],
+                best_mean=best_mean,
+                updates=int(latest_row["update"]),
+                policy_loss=latest_row["policy_loss"],
+                value_loss=latest_row["value_loss"],
+            ),
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("#### Training history")
+        plot_cartpole_training(log_df)
+
+        model, model_err = load_cartpole_model()
+        if model_err:
+            st.error(model_err)
+        else:
+            st.markdown("#### Greedy evaluation")
+            eval_eps = st.slider("Evaluation episodes", min_value=10, max_value=200, value=50, step=10)
+            mean_ret, std_ret, elapsed = evaluate_cartpole(model, eval_eps)
+            st.write(
+                f"Mean return: **{mean_ret:.1f} ± {std_ret:.1f}** (episodes={eval_eps}, seed={CARTPOLE_EVAL_SEED}, "
+                f"time={elapsed:.2f}s)"
+            )
+
+# FrozenLake tab --------------------------------------------------------------
+with frozenlake_tab:
+    frozen_df, frozen_err = load_frozenlake_log()
+    if frozen_err:
+        st.error(frozen_err)
+    else:
+        latest_row = frozen_df.iloc[-1]
+        episode = float(latest_row["episode"])
+        epsilon = linear_schedule(episode, FROZEN_EPSILON_START, FROZEN_EPSILON_END, FROZEN_EPSILON_DECAY)
+        alpha = linear_schedule(episode, FROZEN_ALPHA_START, FROZEN_ALPHA_END, FROZEN_ALPHA_DECAY)
+
         col1, col2, col3 = st.columns(3)
-        col1.metric("Latest mean return", f"{latest_return:.1f}", delta=f"{latest_return - best_return:.1f}" if latest_return != best_return else None)
-        col2.metric("Best mean return", f"{best_return:.1f}", help="Highest rolling score achieved during training (out of 500).")
-        col3.metric("Recent policy loss", f"{mean_policy_loss:.3f}", help="Lower is better — indicates stable updates.")
-
-        plot_cartpole(log_df)
-        with st.expander("What am I looking at?", expanded=False):
-            st.markdown(
-                """
-                - **Blue line:** Average score from the latest batch of training runs.
-                - **Red dashed line:** The 475 target — above this, the agent is effectively perfect.
-                - **Lower chart:** How hard the policy/value heads are working. Stable curves mean steady learning.
-                """
-            )
-
-    model = load_cartpole_model()
-    if model is None:
-        st.warning("CartPole policy weights not found.")
-    else:
         st.markdown(
             """
-            ### Test the trained agent
-            Pick how many trial runs to simulate. We replay the saved policy with greedy actions (no exploration).
-            """
+            <div class="metric-box">
+              <div class="metric-grid">
+                <div class="metric-card">
+                  <div class="metric-label">Current Windowed Win Rate</div>
+                  <div class="metric-value">{win_rate:.2f}</div>
+                </div>
+                <div class="metric-card">
+                  <div class="metric-label">Episodes Trained</div>
+                  <div class="metric-value">{episodes}</div>
+                </div>
+                <div class="metric-card">
+                  <div class="metric-label">ε / α (current)</div>
+                  <div class="metric-value">{eps:.2f} / {alpha_val:.2f}</div>
+                </div>
+              </div>
+            </div>
+            """.format(
+                win_rate=latest_row["win_rate"],
+                episodes=int(episode),
+                eps=epsilon,
+                alpha_val=alpha,
+            ),
+            unsafe_allow_html=True,
         )
-        eval_eps = st.slider("Evaluation episodes", min_value=5, max_value=200, value=50, step=5)
-        if st.button("Run CartPole evaluation", key="eval_cartpole"):
-            mean_ret, std_ret = evaluate_cartpole(model, eval_eps)
-            st.success(f"Average steps balanced: {mean_ret:.1f} ± {std_ret:.1f} (max 500)")
-        with st.expander("How greedy evaluation works", expanded=False):
-            st.markdown(
-                """
-                During training the agent explores randomly. Here we let it act deterministically
-                — always choosing the highest-probability action — to see how well it performs when it
-                simply trusts what it has learned.
-                """
+
+        st.markdown("#### Training history")
+        plot_frozenlake_training(frozen_df)
+
+        q_table, q_err = load_frozenlake_q()
+        if q_err:
+            st.error(q_err)
+        else:
+            st.markdown("#### Greedy evaluation")
+            eval_eps = st.slider("Evaluation episodes", min_value=100, max_value=5000, value=1000, step=100)
+            win_rate, elapsed = evaluate_frozenlake(q_table, eval_eps)
+            st.write(
+                f"Win rate over {eval_eps} episodes: **{win_rate:.2%}** "
+                f"(seed={FROZEN_EVAL_SEED}, time={elapsed:.2f}s). "
+                "Slippery dynamics keep variance high even with a fixed table."
             )
 
-elif section == "FrozenLake":
-    st.header("FrozenLake: slippery maze solver")
-    st.markdown(
-        """
-        **Goal:** Navigate an icy 8×8 grid to reach the goal `G` without falling into holes.
-
-        It is a **slippery** environment, so even optimal choices can slide the agent in unwanted directions.
-        """
-    )
-    frozen_df = load_frozenlake_log()
-    if frozen_df is None:
-        st.warning("FrozenLake win-rate log not found.")
+# AlphaFold-nano tab ----------------------------------------------------------
+with alphafold_tab:
+    accessions, acc_err = load_accessions()
+    if acc_err:
+        st.error(acc_err)
+    elif not accessions:
+        st.warning("Accession list is empty.")
     else:
-        latest_win = float(frozen_df["win_rate"].iloc[-1])
-        best_win = float(frozen_df["win_rate"].max())
-        col1, col2 = st.columns(2)
-        col1.metric("Latest win rate", f"{latest_win:.2%}", delta=f"{latest_win - best_win:.2%}" if latest_win != best_win else None)
-        col2.metric("Best win rate", f"{best_win:.2%}", help="Peak sliding window win rate during training.")
+        st.markdown("Accessions derived from the AlphaFold *Escherichia coli* bundle.")
+        accession = st.selectbox("Accession", options=accessions, index=0)
+        pdb_path = ALPHAFOLD_DIR / accession / f"{accession}.pdb"
+        toy_path = TOY_COORDS_DIR / f"{accession}_coords.npy"
 
-        plot_frozenlake(frozen_df)
-        with st.expander("Reading the curve", expanded=False):
-            st.markdown(
-                """
-                - **Blue line:** Win rate averaged over the most recent batch of episodes.
-                - **Red dashed line:** Project goal of 80% wins. Above it, the agent solves the level reliably.
-                """
-            )
+        alpha_coords, alpha_err = parse_pdb_ca(pdb_path)
+        toy_coords, toy_err = load_toy_coords(toy_path)
 
-    q_table = load_frozenlake_q()
-    if q_table is None:
-        st.warning("FrozenLake Q-table not found.")
-    else:
-        st.markdown(
-            """
-            ### Test the Q-table
-            Choose how many evaluation games to run. We always pick the best action for the current state.
-            """
-        )
-        eval_eps = st.slider("Evaluation episodes", min_value=100, max_value=2000, value=500, step=100, key="frozen_eval")
-        if st.button("Run FrozenLake evaluation", key="eval_frozen"):
-            win_rate = evaluate_frozenlake(q_table, eval_eps)
-            st.success(f"Win rate over {eval_eps} episodes: {win_rate:.2%}")
-        with st.expander("Why results vary", expanded=False):
-            st.markdown(
-                """
-                FrozenLake remains stochastic even with a fixed policy. A single slip can send the agent into a hole,
-                so we average over many games to get a reliable success rate.
-                """
-            )
+        if alpha_err:
+            st.error(alpha_err)
+        if toy_err:
+            st.error(toy_err)
 
-else:
-    st.header("AlphaFold-nano: toy backbone vs. AlphaFold")
-    st.markdown(
-        """
-        **Goal:** Show how a toy sequence→structure model lines up with AlphaFold's predicted backbone.
-
-        We focus on the **Cα trace** (one atom per residue) as a simple visual proxy for overall shape.
-        """
-    )
-    accessions = load_accessions()
-    if not accessions:
-        st.warning("No accession list found. Run data prep scripts first.")
-    else:
-        acc = st.selectbox("Accession", accessions)
-        if acc:
-            pdb_path = DATA_DIR / "alphafold" / acc / f"{acc}.pdb"
-            alpha_coords = load_pdb_ca(pdb_path)
-            toy_coords = load_toy_coords(acc)
-            fig, mean_dev = plot_overlay(alpha_coords, toy_coords)
-            st.pyplot(fig)
-            plt.close(fig)
-            toy_len = toy_coords.shape[0]
+        if alpha_coords is not None and toy_coords is not None:
+            mean_dev = compute_ca_deviation(alpha_coords, toy_coords)
             col1, col2, col3 = st.columns(3)
-            col1.metric("AlphaFold residues", len(alpha_coords))
-            col2.metric("Toy residues", toy_len)
-            col3.metric("Mean Cα deviation", f"{mean_dev:.2f} Å", help="Average distance between matching Cα atoms across the overlap region.")
+            st.markdown(
+                """
+                <div class="metric-box">
+                  <div class="metric-grid">
+                    <div class="metric-card">
+                      <div class="metric-label">AlphaFold Cα residues</div>
+                      <div class="metric-value">{af_residue}</div>
+                    </div>
+                    <div class="metric-card">
+                      <div class="metric-label">Toy residues</div>
+                      <div class="metric-value">{toy_residue}</div>
+                    </div>
+                    <div class="metric-card">
+                      <div class="metric-label">Mean Cα deviation (Å)</div>
+                      <div class="metric-value">{mean_dev:.2f}</div>
+                    </div>
+                  </div>
+                </div>
+                """.format(
+                    af_residue=alpha_coords.shape[0],
+                    toy_residue=toy_coords.shape[0],
+                    mean_dev=mean_dev,
+                ),
+                unsafe_allow_html=True,
+            )
 
-            with st.expander("How to read the overlay", expanded=False):
-                st.markdown(
-                    """
-                    - The **blue path** shows AlphaFold’s Cα coordinates projected onto the XY plane.
-                    - The **orange path** is our toy model’s backbone. Because it is simplified, expect it to wobble more.
-                    - The **mean deviation** summarizes how far apart the traces are on average (lower is better).
-                    """
-                )
-            st.caption("Tip: Try switching accessions to see how the toy model handles different protein lengths.")
+            st.markdown("#### Backbone overlay")
+            plot_backbone_overlay(alpha_coords, toy_coords)
