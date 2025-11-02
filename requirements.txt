@@ -1,0 +1,8 @@
+gymnasium
+torch
+numpy
+pandas
+streamlit
+matplotlib
+biopython
+requests
